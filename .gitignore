@@ -1,0 +1,20 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Datos locales y secretos de desarrollo
+*.db
+**/server/certs/
+.pwmanager/
+
+# Editor / SO
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
