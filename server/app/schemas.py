@@ -84,3 +84,36 @@ class VaultOut(BaseModel):
 
 class VersionOut(BaseModel):
     version: int
+
+
+# ---- Passkeys --------------------------------------------------------------- #
+class PasskeyIn(BaseModel):
+    public_key: str
+    label: str = Field(min_length=1, max_length=64)
+    # Firma de enc("pm-passkey-register-v1", email, public_key): prueba de posesión.
+    proof: str
+
+
+class PasskeyOut(BaseModel):
+    credential_id: int
+    label: str
+    public_key: str
+    created_at: str
+    last_used_at: str | None = None
+
+
+class ChallengeIn(BaseModel):
+    email: Email
+
+
+class ChallengeOut(BaseModel):
+    challenge_id: str
+    challenge: str
+    expires_in: int
+
+
+class VerifyIn(BaseModel):
+    email: Email
+    challenge_id: str = Field(min_length=1, max_length=32)
+    credential_id: int
+    signature: str

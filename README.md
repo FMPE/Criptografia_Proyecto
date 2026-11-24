@@ -40,6 +40,24 @@ Por defecto el servidor usa SQLite; para PostgreSQL basta con
 | Flujos de registro / desbloqueo / guardado | [client/vault/manager.py](client/vault/manager.py) |
 | `Argon2id(AuthKey, salt_srv)`, tokens hasheados, rate limiting | [server/app/security.py](server/app/security.py) |
 | PUT con versión esperada atómica (409 si no coincide) | [server/app/vault.py](server/app/vault.py) |
+| Passkeys Ed25519: par generado en el cliente, privada guardada en la bóveda (bajo VK) | [client/crypto/passkeys.py](client/crypto/passkeys.py), [client/vault/models.py](client/vault/models.py) |
+| Challenge de un solo uso, prueba de posesión al registrar, verificación de firma | [server/app/passkeys.py](server/app/passkeys.py) |
+
+### Passkeys
+
+Mensajes firmados (con etiqueta de dominio y prefijo de longitud):
+
+- login: `enc("pm-passkey-auth-v1", email, challenge_id, challenge)`
+- registro: `enc("pm-passkey-register-v1", email, public_key)`, como prueba de posesión
+
+El challenge (32 B, TTL 60 s) se borra **antes** de verificar la firma, así que es
+de un solo uso aunque la firma falle. Como la llave privada vive dentro de la bóveda,
+la passkey solo se usa con la bóveda ya abierta. Sirve para dos cosas:
+
+1. **Renovar la sesión:** si el token expira, `save()` y `pull()` se re-autentican
+   con la passkey sin pedir la contraseña.
+2. **Desbloquear con passkey** en un dispositivo ya usado: la bóveda se abre desde la
+   caché local y el servidor solo recibe la firma. **AuthKey nunca viaja.**
 
 ## API
 
@@ -50,9 +68,15 @@ Por defecto el servidor usa SQLite; para PostgreSQL basta con
 | `POST /login` | verifica Argon2id(AuthKey) → token (15 min) |
 | `GET /vault` | blob, nonce, versión y VK envuelta |
 | `PUT /vault` | acepta sólo `versión == actual + 1`, si no 409 |
+| `POST /passkeys` | registra una llave pública Ed25519 (requiere sesión y prueba de posesión) |
+| `GET /passkeys` | lista las passkeys de la cuenta |
+| `DELETE /passkeys/{id}` | revoca una passkey |
+| `POST /auth/challenge` | challenge de 32 B, un solo uso, 60 s (misma respuesta si el correo no existe) |
+| `POST /auth/verify` | verifica la firma Ed25519 → token |
 
 ## Estado
 
 - **P0 (hecho):** motor criptográfico, bóveda (crear/editar/duplicar/eliminar/buscar/filtrar por etiqueta), generador, servidor (registro, login, blob), TLS 1.3, UI PySide6, CI con bandit + semgrep + pip-audit.
-- **P1 (pendiente):** passkeys Ed25519 (`client/crypto/passkeys.py`, `server/app/passkeys.py` son stubs), verificación local anti-rollback (la versión ya está en el AAD, falta que el cliente recuerde la última versión vista), cambio de contraseña maestra, bloqueo automático y limpieza del portapapeles.
+- **P1 (hecho):** passkeys Ed25519 con challenge-response (crear, revocar, renovar la sesión, desbloquear sin enviar AuthKey).
+- **P1 (pendiente):** verificación local anti-rollback (la versión ya está en el AAD, falta que el cliente recuerde la última versión vista), cambio de contraseña maestra, bloqueo automático y limpieza del portapapeles.
 - **P2:** certificate pinning por huella, padding del blob, exportación cifrada, Docker Compose.

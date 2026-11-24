@@ -1,4 +1,4 @@
-"""Diálogos: desbloqueo/registro, kit de emergencia y generador."""
+"""Diálogos: desbloqueo/registro, kit de emergencia, generador y passkeys."""
 
 from __future__ import annotations
 
@@ -10,8 +10,11 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -79,7 +82,16 @@ class LoginDialog(QDialog):
 
         form.addRow("Correo", self.u_email)
         form.addRow("Contraseña maestra", self.u_password)
+        self.u_passkey = QCheckBox("Iniciar sesión con passkey (no envía AuthKey al servidor)")
+        self.u_passkey.setToolTip(
+            "La bóveda se abre localmente y el servidor sólo recibe una firma Ed25519 "
+            "sobre un challenge de un solo uso. Requiere un dispositivo ya usado."
+        )
+
+        form.addRow("Correo", self.u_email)
+        form.addRow("Contraseña maestra", self.u_password)
         form.addRow(self.u_secret_label, self.u_secret)
+        form.addRow(self.u_passkey)
         form.addRow(btn)
         form.addRow(self.u_status)
         return w
@@ -89,7 +101,12 @@ class LoginDialog(QDialog):
         self.u_status.setText("Derivando llaves con Argon2id (64 MiB)…")
         try:
             with busy():
-                self.manager.unlock(self.u_email.text(), self.u_password.text(), secret)
+                self.manager.unlock(
+                    self.u_email.text(),
+                    self.u_password.text(),
+                    secret,
+                    use_passkey=self.u_passkey.isChecked(),
+                )
         except SecretKeyRequiredError:
             self.u_secret.setVisible(True)
             self.u_secret_label.setVisible(True)
@@ -255,6 +272,82 @@ class GeneratorDialog(QDialog):
 
     def password(self) -> str:
         return self.output.text()
+
+
+class PasskeysDialog(QDialog):
+    """Lista, crea y revoca las passkeys Ed25519 de la cuenta."""
+
+    def __init__(self, manager: VaultManager, parent=None) -> None:
+        super().__init__(parent)
+        self.manager = manager
+        self.changed = False
+        self.setWindowTitle("Passkeys")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                "Cada passkey es un par Ed25519. La llave privada se guarda cifrada "
+                "dentro de tu bóveda; el servidor sólo conoce la llave pública."
+            )
+        )
+        self.list = QListWidget()
+        layout.addWidget(self.list)
+
+        row = QHBoxLayout()
+        create = QPushButton("Crear passkey")
+        create.clicked.connect(self._create)
+        revoke = QPushButton("Revocar")
+        revoke.clicked.connect(self._revoke)
+        test = QPushButton("Probar login")
+        test.clicked.connect(self._test)
+        close = QPushButton("Cerrar")
+        close.clicked.connect(self.accept)
+        for b in (create, revoke, test, close):
+            row.addWidget(b)
+        layout.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.list.clear()
+        for pk in self.manager.vault.passkeys():
+            fingerprint = pk.public_key[:16]
+            item = QListWidgetItem(f"{pk.label}   ·   pk {fingerprint}…   ·   {pk.created_at}")
+            item.setData(Qt.UserRole, pk.credential_id)
+            self.list.addItem(item)
+
+    def _run(self, action, ok_msg: str) -> None:
+        try:
+            with busy():
+                action()
+        except (VaultError, ApiError, NetworkError, ValueError) as exc:
+            self.status.setText(f"⚠ {exc}")
+            return
+        self.status.setText(ok_msg)
+        self.refresh()
+
+    def _create(self) -> None:
+        label, ok = QInputDialog.getText(self, "Nueva passkey", "Etiqueta (p. ej. «laptop»):")
+        if ok and label.strip():
+            self.changed = True
+            self._run(lambda: self.manager.create_passkey(label.strip()[:64]),
+                      "Passkey creada y guardada en la bóveda.")
+
+    def _revoke(self) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            return
+        if QMessageBox.question(self, "Revocar", "¿Revocar esta passkey?") != QMessageBox.Yes:
+            return
+        self.changed = True
+        self._run(lambda: self.manager.revoke_passkey(item.data(Qt.UserRole)),
+                  "Passkey revocada en el servidor y eliminada de la bóveda.")
+
+    def _test(self) -> None:
+        self._run(self.manager.login_with_passkey,
+                  "Challenge firmado y verificado: el servidor emitió un token nuevo.")
 
 
 def copy_to_clipboard(text: str) -> None:

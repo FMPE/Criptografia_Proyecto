@@ -52,6 +52,30 @@ class VaultBlob(Base):
     user: Mapped[User] = relationship(back_populates="vault")
 
 
+class Passkey(Base):
+    """Llave pública Ed25519. La privada nunca llega al servidor."""
+
+    __tablename__ = "passkeys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    public_key: Mapped[bytes] = mapped_column(LargeBinary(32), unique=True)
+    label: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AuthChallenge(Base):
+    """Challenge de 32 B, de un solo uso (se borra al verificar) y con expiración."""
+
+    __tablename__ = "auth_challenges"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    challenge: Mapped[bytes] = mapped_column(LargeBinary(32))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class SessionToken(Base):
     __tablename__ = "sessions"
 

@@ -39,9 +39,46 @@ class Entry:
         return cls(**{k: v for k, v in d.items() if k in allowed})
 
 
+@dataclass
+class Passkey:
+    """Par Ed25519 guardado dentro de la bóveda: la privada sólo existe cifrada bajo VK."""
+
+    credential_id: int  # id que asignó el servidor al registrar la pública
+    label: str
+    private_key: str  # seed Ed25519 en Base64
+    public_key: str  # Base64
+    created_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Passkey":
+        allowed = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in d.items() if k in allowed})
+
+
 class Vault:
-    def __init__(self, entries: list[Entry] | None = None) -> None:
+    def __init__(
+        self, entries: list[Entry] | None = None, passkeys: list[Passkey] | None = None
+    ) -> None:
         self._entries: dict[str, Entry] = {e.id: e for e in (entries or [])}
+        self._passkeys: dict[int, Passkey] = {p.credential_id: p for p in (passkeys or [])}
+
+    # ---- Passkeys (no son entradas: no aparecen en búsquedas) ------------- #
+    def add_passkey(self, pk: Passkey) -> Passkey:
+        if pk.credential_id in self._passkeys:
+            raise ValueError("Ya existe una passkey con ese id")
+        self._passkeys[pk.credential_id] = pk
+        return pk
+
+    def remove_passkey(self, credential_id: int) -> None:
+        if self._passkeys.pop(credential_id, None) is None:
+            raise KeyError(f"No existe la passkey {credential_id}")
+
+    def passkeys(self) -> list[Passkey]:
+        return sorted(self._passkeys.values(), key=lambda p: p.created_at)
+
+    def latest_passkey(self) -> Passkey | None:
+        pks = self.passkeys()
+        return pks[-1] if pks else None
 
     # ---- CRUD ------------------------------------------------------------- #
     def add(self, entry: Entry) -> Entry:
@@ -101,7 +138,11 @@ class Vault:
 
     # ---- Serialización ---------------------------------------------------- #
     def to_bytes(self) -> bytes:
-        doc = {"format": VAULT_FORMAT, "entries": [asdict(e) for e in self.all()]}
+        doc = {
+            "format": VAULT_FORMAT,
+            "entries": [asdict(e) for e in self.all()],
+            "passkeys": [asdict(p) for p in self.passkeys()],
+        }
         return json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     @classmethod
@@ -109,4 +150,8 @@ class Vault:
         doc = json.loads(data.decode("utf-8"))
         if doc.get("format") != VAULT_FORMAT:
             raise ValueError("Formato de bóveda no soportado")
-        return cls([Entry.from_dict(e) for e in doc["entries"]])
+        return cls(
+            [Entry.from_dict(e) for e in doc["entries"]],
+            # Opcional: las bóvedas creadas antes de las passkeys no tienen esta clave.
+            [Passkey.from_dict(p) for p in doc.get("passkeys", [])],
+        )

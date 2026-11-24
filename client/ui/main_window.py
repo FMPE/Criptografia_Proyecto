@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from client.vault.manager import VaultError, VaultManager
 from client.vault.models import Entry
 
-from .dialogs import GeneratorDialog, copy_to_clipboard
+from .dialogs import GeneratorDialog, PasskeysDialog, copy_to_clipboard
 from .util import busy
 
 ALL_TAGS = "Todas las etiquetas"
@@ -114,6 +114,7 @@ class MainWindow(QMainWindow):
         tb = self.addToolBar("Bóveda")
         tb.addAction("Sincronizar (subir)", self.sync_push)
         tb.addAction("Recargar del servidor", self.sync_pull)
+        tb.addAction("Passkeys…", self.open_passkeys)
         tb.addAction("Bloquear", self.lock)
 
         self.refresh_list()
@@ -128,7 +129,18 @@ class MainWindow(QMainWindow):
     def update_status(self, extra: str = "") -> None:
         mode = "en línea" if self.manager.online else "SIN CONEXIÓN (sólo lectura)"
         pending = " · cambios sin subir" if self.dirty else " · sincronizado"
-        self.statusBar().showMessage(f"v{self.manager.version} · {mode}{pending} {extra}")
+        method = f" · sesión por {self.manager.auth_method}" if self.manager.auth_method else ""
+        self.statusBar().showMessage(
+            f"v{self.manager.version} · {mode}{pending}{method} {extra}"
+        )
+
+    def open_passkeys(self) -> None:
+        before = self.manager.version
+        PasskeysDialog(self.manager, self).exec()
+        # Crear/revocar guarda la bóveda completa: si subió de versión, todo quedó sincronizado.
+        if self.manager.version > before:
+            self.dirty = False
+        self.update_status()
 
     def refresh_list(self) -> None:
         tag = self.tag_filter.currentText()

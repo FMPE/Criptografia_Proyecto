@@ -171,3 +171,41 @@ class ApiClient:
             },
         )
         return int(data["version"])
+
+    # ------------------------------------------------------------------ #
+    # Passkeys
+    # ------------------------------------------------------------------ #
+    def register_passkey(self, public_key: bytes, label: str, proof: bytes) -> int:
+        data = self._request(
+            "POST",
+            "/passkeys",
+            auth=True,
+            json={"public_key": _b64(public_key), "label": label, "proof": _b64(proof)},
+        )
+        return int(data["credential_id"])
+
+    def list_passkeys(self) -> list[dict]:
+        return self._request("GET", "/passkeys", auth=True)
+
+    def delete_passkey(self, credential_id: int) -> None:
+        self._request("DELETE", f"/passkeys/{int(credential_id)}", auth=True)
+
+    def passkey_challenge(self, email: str) -> tuple[str, bytes]:
+        data = self._request("POST", "/auth/challenge", json={"email": email})
+        return data["challenge_id"], _unb64(data["challenge"])
+
+    def passkey_verify(
+        self, email: str, challenge_id: str, credential_id: int, signature: bytes
+    ) -> str:
+        data = self._request(
+            "POST",
+            "/auth/verify",
+            json={
+                "email": email,
+                "challenge_id": challenge_id,
+                "credential_id": credential_id,
+                "signature": _b64(signature),
+            },
+        )
+        self.token = data["token"]
+        return self.token

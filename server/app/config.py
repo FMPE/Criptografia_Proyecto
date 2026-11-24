@@ -25,6 +25,8 @@ class Settings:
     login_max_failures: int = field(default_factory=lambda: _int("PM_LOGIN_MAX_FAILURES", 5))
     login_window_seconds: int = field(default_factory=lambda: _int("PM_LOGIN_WINDOW", 5 * 60))
     max_blob_bytes: int = field(default_factory=lambda: _int("PM_MAX_BLOB_BYTES", 5 * 1024 * 1024))
+    challenge_ttl_seconds: int = field(default_factory=lambda: _int("PM_CHALLENGE_TTL", 60))
+    max_passkeys_per_user: int = field(default_factory=lambda: _int("PM_MAX_PASSKEYS", 10))
 
     # Llave para generar salts falsos deterministas en /kdf-params ante correos
     # inexistentes (evita enumerar usuarios). Debe ser estable entre reinicios.
