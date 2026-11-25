@@ -1,355 +1,306 @@
-"""Diálogos: desbloqueo/registro, kit de emergencia, generador y passkeys."""
+"""Diálogos: confirmación, kit de emergencia, generador y passkeys."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QGuiApplication
-from PySide6.QtWidgets import (
-    QCheckBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+import asyncio
+from typing import Callable
+
+import flet as ft
 
 from client.crypto.generator import (
+    MAX_LENGTH,
+    MIN_LENGTH,
     GeneratorOptions,
     estimate_generator_entropy,
-    estimate_password_entropy,
     generate_password,
 )
-from client.crypto.keys import InvalidSecretKeyError
-from client.net.api_client import ApiError, NetworkError, RateLimitedError
-from client.vault.manager import (
-    SecretKeyRequiredError,
-    VaultError,
-    VaultManager,
-)
+from client.net.api_client import ApiError, NetworkError
+from client.vault.manager import VaultError, VaultManager
 
-from .util import busy
+from .async_ops import Ui
+from .clipboard import copy_to_clipboard
+
+MONO = "Consolas"
 
 
-def _password_field() -> QLineEdit:
-    f = QLineEdit()
-    f.setEchoMode(QLineEdit.Password)
-    return f
+def strength(bits: float) -> tuple[float, str, str]:
+    """(fracción para la barra, color, etiqueta) a partir de bits de entropía."""
+    if bits < 50:
+        return min(bits / 128, 1.0), ft.Colors.RED, "Débil"
+    if bits < 80:
+        return bits / 128, ft.Colors.ORANGE, "Aceptable"
+    return min(bits / 128, 1.0), ft.Colors.GREEN, "Fuerte"
 
 
-class LoginDialog(QDialog):
-    """Pestañas: desbloquear (incluye dispositivo nuevo) y crear cuenta."""
+# --------------------------------------------------------------------------- #
+# Confirmación
+# --------------------------------------------------------------------------- #
+async def confirm(
+    ui: Ui, title: str, message: str, ok_label: str = "Aceptar", destructive: bool = False
+) -> bool:
+    answer: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
-    def __init__(self, manager: VaultManager, parent=None) -> None:
-        super().__init__(parent)
-        self.manager = manager
-        self.new_secret_key: str | None = None
-        self.setWindowTitle("Gestor de contraseñas")
-        self.setMinimumWidth(460)
+    def close(value: bool):
+        def handler(_e):
+            ui.page.pop_dialog()
+            if not answer.done():
+                answer.set_result(value)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._unlock_tab(), "Desbloquear")
-        tabs.addTab(self._register_tab(), "Crear cuenta")
-        layout = QVBoxLayout(self)
-        layout.addWidget(tabs)
+        return handler
 
-    # ---------------------------------------------------------------- #
-    def _unlock_tab(self) -> QWidget:
-        w = QWidget()
-        form = QFormLayout(w)
-        self.u_email = QLineEdit()
-        self.u_password = _password_field()
-        self.u_secret = QLineEdit()
-        self.u_secret.setPlaceholderText("PM1-XXXXX-... (sólo en un dispositivo nuevo)")
-        self.u_secret.setVisible(False)
-        self.u_secret_label = QLabel("Secret Key")
-        self.u_secret_label.setVisible(False)
-        self.u_status = QLabel("")
-        self.u_status.setWordWrap(True)
-        btn = QPushButton("Desbloquear")
-        btn.setDefault(True)
-        btn.clicked.connect(self._do_unlock)
-        self.u_password.returnPressed.connect(self._do_unlock)
-
-        form.addRow("Correo", self.u_email)
-        form.addRow("Contraseña maestra", self.u_password)
-        self.u_passkey = QCheckBox("Iniciar sesión con passkey (no envía AuthKey al servidor)")
-        self.u_passkey.setToolTip(
-            "La bóveda se abre localmente y el servidor sólo recibe una firma Ed25519 "
-            "sobre un challenge de un solo uso. Requiere un dispositivo ya usado."
+    ui.page.show_dialog(
+        ft.AlertDialog(
+            modal=True,
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[
+                ft.TextButton("Cancelar", on_click=close(False)),
+                ft.FilledButton(
+                    ok_label,
+                    on_click=close(True),
+                    bgcolor=ft.Colors.ERROR if destructive else None,
+                    color=ft.Colors.ON_ERROR if destructive else None,
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
         )
+    )
+    return await answer
 
-        form.addRow("Correo", self.u_email)
-        form.addRow("Contraseña maestra", self.u_password)
-        form.addRow(self.u_secret_label, self.u_secret)
-        form.addRow(self.u_passkey)
-        form.addRow(btn)
-        form.addRow(self.u_status)
-        return w
 
-    def _do_unlock(self) -> None:
-        secret = self.u_secret.text().strip() or None
-        self.u_status.setText("Derivando llaves con Argon2id (64 MiB)…")
-        try:
-            with busy():
-                self.manager.unlock(
-                    self.u_email.text(),
-                    self.u_password.text(),
-                    secret,
-                    use_passkey=self.u_passkey.isChecked(),
-                )
-        except SecretKeyRequiredError:
-            self.u_secret.setVisible(True)
-            self.u_secret_label.setVisible(True)
-            self.u_status.setText(
-                "Dispositivo nuevo: ingresa la Secret Key de tu kit de emergencia."
-            )
-            return
-        except (VaultError, InvalidSecretKeyError, RateLimitedError, ValueError) as exc:
-            self.u_status.setText(f"⚠ {exc}")
-            return
-        except (ApiError, NetworkError) as exc:
-            self.u_status.setText(f"⚠ Error del servidor: {exc}")
-            return
-        finally:
-            self.u_password.clear()
-        self.accept()
+# --------------------------------------------------------------------------- #
+# Kit de emergencia
+# --------------------------------------------------------------------------- #
+def show_emergency_kit(ui: Ui, email: str, secret_key: str) -> None:
+    ok = ft.FilledButton("Listo", disabled=True, on_click=lambda _e: ui.page.pop_dialog())
 
-    # ---------------------------------------------------------------- #
-    def _register_tab(self) -> QWidget:
-        w = QWidget()
-        form = QFormLayout(w)
-        self.r_email = QLineEdit()
-        self.r_password = _password_field()
-        self.r_confirm = _password_field()
-        self.r_meter = QLabel("Entropía estimada: 0 bits")
-        self.r_password.textChanged.connect(
-            lambda t: self.r_meter.setText(
-                f"Entropía estimada: {estimate_password_entropy(t):.0f} bits (mínimo 50)"
-            )
+    def toggle(e):
+        ok.disabled = not e.control.value
+        ok.update()
+
+    async def copy(_e):
+        await copy_to_clipboard(ui, secret_key, "Secret Key")
+
+    ui.page.show_dialog(
+        ft.AlertDialog(
+            modal=True,  # no se cierra sin confirmar
+            title=ft.Row([ft.Icon(ft.Icons.VPN_KEY), ft.Text("Kit de emergencia")]),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Esta Secret Key se muestra una sola vez. Guárdala fuera de la "
+                        "aplicación (impresa o en papel). Sin ella no podrás abrir tu bóveda "
+                        "en otro dispositivo, aunque recuerdes la contraseña maestra.",
+                    ),
+                    ft.Text(f"Cuenta: {email}", color=ft.Colors.ON_SURFACE_VARIANT),
+                    ft.Container(
+                        content=ft.Text(secret_key, font_family=MONO, size=18, selectable=True),
+                        padding=16,
+                        border_radius=ft.BorderRadius.all(8),
+                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    ),
+                    ft.Row([ft.OutlinedButton("Copiar", icon=ft.Icons.CONTENT_COPY, on_click=copy)]),
+                    ft.Checkbox(label="Confirmo que la guardé.", on_change=toggle),
+                ],
+                tight=True,
+                spacing=12,
+                width=520,
+            ),
+            actions=[ok],
         )
-        self.r_status = QLabel("")
-        self.r_status.setWordWrap(True)
-        btn = QPushButton("Crear cuenta")
-        btn.clicked.connect(self._do_register)
-
-        form.addRow("Correo", self.r_email)
-        form.addRow("Contraseña maestra", self.r_password)
-        form.addRow("Confirmar", self.r_confirm)
-        form.addRow(self.r_meter)
-        form.addRow(btn)
-        form.addRow(self.r_status)
-        return w
-
-    def _do_register(self) -> None:
-        if self.r_password.text() != self.r_confirm.text():
-            self.r_status.setText("⚠ Las contraseñas no coinciden")
-            return
-        self.r_status.setText("Generando Secret Key y derivando llaves…")
-        try:
-            with busy():
-                self.new_secret_key = self.manager.register(
-                    self.r_email.text(), self.r_password.text()
-                )
-        except (VaultError, ValueError) as exc:
-            self.r_status.setText(f"⚠ {exc}")
-            return
-        except (ApiError, NetworkError) as exc:
-            self.r_status.setText(f"⚠ Error del servidor: {exc}")
-            return
-        finally:
-            self.r_password.clear()
-            self.r_confirm.clear()
-        self.accept()
+    )
 
 
-class EmergencyKitDialog(QDialog):
-    def __init__(self, email: str, secret_key: str, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Kit de emergencia")
-        layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel(
-                "<b>Esta Secret Key se muestra una sola vez.</b><br>"
-                "Guárdala fuera de la aplicación (impresa o en papel). Sin ella no podrás "
-                "abrir tu bóveda en otro dispositivo, aunque recuerdes la contraseña maestra."
-            )
+# --------------------------------------------------------------------------- #
+# Generador
+# --------------------------------------------------------------------------- #
+class GeneratorDialog:
+    def __init__(self, ui: Ui, on_use: Callable[[str], None] | None = None) -> None:
+        self.ui = ui
+        self.on_use = on_use
+        self.output = ft.Text("", font_family=MONO, size=18, selectable=True)
+        self.length = ft.Slider(
+            min=MIN_LENGTH, max=64, divisions=64 - MIN_LENGTH, value=20,
+            label="{value}", on_change=self._regen,
         )
-        layout.addWidget(QLabel(f"Cuenta: {email}"))
-        key = QLabel(secret_key)
-        key.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        font = QFont("Consolas")
-        font.setPointSize(13)
-        key.setFont(font)
-        key.setWordWrap(True)
-        layout.addWidget(key)
+        self.length_text = ft.Text("Longitud: 20")
+        self.lower = ft.Switch(label="Minúsculas", value=True, on_change=self._regen)
+        self.upper = ft.Switch(label="Mayúsculas", value=True, on_change=self._regen)
+        self.digits = ft.Switch(label="Dígitos", value=True, on_change=self._regen)
+        self.symbols = ft.Switch(label="Símbolos", value=True, on_change=self._regen)
+        self.ambiguous = ft.Switch(label="Evitar ambiguos (I l 1 O 0)", value=False, on_change=self._regen)
+        self.bar = ft.ProgressBar(value=0, bar_height=8, border_radius=ft.BorderRadius.all(4))
+        self.entropy = ft.Text("")
 
-        confirm = QCheckBox("Confirmo que la guardé.")
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
-        buttons.button(QDialogButtonBox.Ok).setEnabled(False)
-        confirm.toggled.connect(buttons.button(QDialogButtonBox.Ok).setEnabled)
-        buttons.accepted.connect(self.accept)
-        layout.addWidget(confirm)
-        layout.addWidget(buttons)
+        actions = [
+            ft.TextButton("Cerrar", on_click=lambda _e: ui.page.pop_dialog()),
+            ft.OutlinedButton("Copiar", icon=ft.Icons.CONTENT_COPY, on_click=self._copy),
+        ]
+        if on_use:
+            actions.append(ft.FilledButton("Usar", icon=ft.Icons.CHECK, on_click=self._use))
 
-    def reject(self) -> None:  # no se puede cerrar sin confirmar
-        QMessageBox.information(self, "Kit de emergencia", "Confirma que guardaste la Secret Key.")
-
-
-class GeneratorDialog(QDialog):
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Generador de contraseñas")
-        self.setMinimumWidth(420)
-        layout = QVBoxLayout(self)
-
-        self.output = QLineEdit()
-        self.output.setReadOnly(True)
-        self.output.setFont(QFont("Consolas", 12))
-        layout.addWidget(self.output)
-
-        form = QFormLayout()
-        self.length = QSpinBox()
-        self.length.setRange(8, 128)
-        self.length.setValue(20)
-        self.lower = QCheckBox("Minúsculas")
-        self.upper = QCheckBox("Mayúsculas")
-        self.digits = QCheckBox("Dígitos")
-        self.symbols = QCheckBox("Símbolos")
-        self.ambiguous = QCheckBox("Evitar caracteres ambiguos (I l 1 O 0)")
-        for cb in (self.lower, self.upper, self.digits, self.symbols):
-            cb.setChecked(True)
-        form.addRow("Longitud", self.length)
-        for cb in (self.lower, self.upper, self.digits, self.symbols, self.ambiguous):
-            form.addRow(cb)
-            cb.toggled.connect(self.regenerate)
-        self.length.valueChanged.connect(self.regenerate)
-        layout.addLayout(form)
-
-        self.entropy = QLabel()
-        layout.addWidget(self.entropy)
-        layout.addWidget(QLabel("Fuente: CSPRNG del sistema operativo (secrets)"))
-
-        row = QHBoxLayout()
-        again = QPushButton("Regenerar")
-        again.clicked.connect(self.regenerate)
-        row.addWidget(again)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Usar")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        row.addWidget(buttons)
-        layout.addLayout(row)
-        self.regenerate()
+        self.dialog = ft.AlertDialog(
+            title=ft.Row([ft.Icon(ft.Icons.AUTO_AWESOME), ft.Text("Generador de contraseñas")]),
+            content=ft.Column(
+                [
+                    ft.Container(
+                        content=ft.Row(
+                            [self.output, ft.IconButton(ft.Icons.REFRESH, tooltip="Regenerar", on_click=self._regen)],
+                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        ),
+                        padding=ft.Padding.symmetric(horizontal=16, vertical=8),
+                        border_radius=ft.BorderRadius.all(8),
+                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    ),
+                    self.bar,
+                    self.entropy,
+                    self.length_text,
+                    self.length,
+                    ft.Row([self.lower, self.upper], wrap=True),
+                    ft.Row([self.digits, self.symbols], wrap=True),
+                    self.ambiguous,
+                    ft.Text(
+                        f"Fuente: CSPRNG del sistema operativo (secrets). Máximo {MAX_LENGTH} con la API.",
+                        size=12, color=ft.Colors.ON_SURFACE_VARIANT,
+                    ),
+                ],
+                tight=True,
+                spacing=10,
+                width=520,
+            ),
+            actions=actions,
+        )
+        self._regen(None, update=False)
 
     def options(self) -> GeneratorOptions:
         return GeneratorOptions(
-            length=self.length.value(),
-            lower=self.lower.isChecked(),
-            upper=self.upper.isChecked(),
-            digits=self.digits.isChecked(),
-            symbols=self.symbols.isChecked(),
-            avoid_ambiguous=self.ambiguous.isChecked(),
+            length=int(self.length.value),
+            lower=self.lower.value,
+            upper=self.upper.value,
+            digits=self.digits.value,
+            symbols=self.symbols.value,
+            avoid_ambiguous=self.ambiguous.value,
         )
 
-    def regenerate(self) -> None:
+    def _regen(self, _e, update: bool = True) -> None:
         opts = self.options()
+        self.length_text.value = f"Longitud: {opts.length}"
         try:
-            self.output.setText(generate_password(opts))
-            self.entropy.setText(f"Entropía estimada: {estimate_generator_entropy(opts):.0f} bits")
+            self.output.value = generate_password(opts)
+            bits = estimate_generator_entropy(opts)
+            self.bar.value, self.bar.color, label = strength(bits)
+            self.entropy.value = f"{label} · entropía estimada: {bits:.0f} bits"
         except ValueError as exc:
-            self.output.clear()
-            self.entropy.setText(f"⚠ {exc}")
+            self.output.value = ""
+            self.bar.value = 0
+            self.entropy.value = f"⚠ {exc}"
+        if update:
+            self.dialog.update()
 
-    def password(self) -> str:
-        return self.output.text()
+    async def _copy(self, _e) -> None:
+        await copy_to_clipboard(self.ui, self.output.value, "Contraseña")
+
+    def _use(self, _e) -> None:
+        if self.output.value and self.on_use:
+            self.on_use(self.output.value)
+        self.ui.page.pop_dialog()
+
+    def show(self) -> None:
+        self.ui.page.show_dialog(self.dialog)
 
 
-class PasskeysDialog(QDialog):
-    """Lista, crea y revoca las passkeys Ed25519 de la cuenta."""
+# --------------------------------------------------------------------------- #
+# Passkeys
+# --------------------------------------------------------------------------- #
+class PasskeysDialog:
+    """Lista, crea, revoca y prueba las passkeys Ed25519 de la cuenta."""
 
-    def __init__(self, manager: VaultManager, parent=None) -> None:
-        super().__init__(parent)
+    def __init__(self, ui: Ui, manager: VaultManager, on_change: Callable[[], None]) -> None:
+        self.ui = ui
         self.manager = manager
-        self.changed = False
-        self.setWindowTitle("Passkeys")
-        self.setMinimumWidth(460)
-        layout = QVBoxLayout(self)
-        layout.addWidget(
-            QLabel(
-                "Cada passkey es un par Ed25519. La llave privada se guarda cifrada "
-                "dentro de tu bóveda; el servidor sólo conoce la llave pública."
-            )
+        self.on_change = on_change
+        self.list = ft.Column(spacing=0, tight=True)
+        self.label = ft.TextField(label="Etiqueta de la nueva passkey", hint_text="p. ej. laptop", dense=True, expand=True, on_submit=self._create)
+        self.status = ft.Text("", size=13)
+        self.dialog = ft.AlertDialog(
+            title=ft.Row([ft.Icon(ft.Icons.FINGERPRINT), ft.Text("Passkeys")]),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Cada passkey es un par Ed25519. La llave privada se guarda cifrada "
+                        "dentro de tu bóveda; el servidor sólo conoce la llave pública.",
+                        size=13, color=ft.Colors.ON_SURFACE_VARIANT,
+                    ),
+                    self.list,
+                    ft.Row([self.label, ft.FilledButton("Crear", icon=ft.Icons.ADD, on_click=self._create)]),
+                    self.status,
+                ],
+                tight=True,
+                spacing=12,
+                width=540,
+            ),
+            actions=[
+                ft.OutlinedButton("Probar login", icon=ft.Icons.KEY, on_click=self._test),
+                ft.TextButton("Cerrar", on_click=lambda _e: ui.page.pop_dialog()),
+            ],
         )
-        self.list = QListWidget()
-        layout.addWidget(self.list)
+        self._refresh(update=False)
 
-        row = QHBoxLayout()
-        create = QPushButton("Crear passkey")
-        create.clicked.connect(self._create)
-        revoke = QPushButton("Revocar")
-        revoke.clicked.connect(self._revoke)
-        test = QPushButton("Probar login")
-        test.clicked.connect(self._test)
-        close = QPushButton("Cerrar")
-        close.clicked.connect(self.accept)
-        for b in (create, revoke, test, close):
-            row.addWidget(b)
-        layout.addLayout(row)
-        self.status = QLabel("")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        self.refresh()
+    def _refresh(self, update: bool = True) -> None:
+        self.list.controls.clear()
+        pks = self.manager.vault.passkeys()
+        if not pks:
+            self.list.controls.append(ft.Text("Todavía no hay passkeys.", italic=True))
+        for pk in pks:
+            self.list.controls.append(
+                ft.ListTile(
+                    leading=ft.Icon(ft.Icons.KEY),
+                    title=ft.Text(pk.label),
+                    subtitle=ft.Text(f"pk {pk.public_key[:16]}…  ·  {pk.created_at}", font_family=MONO, size=12),
+                    trailing=ft.IconButton(
+                        ft.Icons.DELETE_OUTLINE, tooltip="Revocar",
+                        icon_color=ft.Colors.ERROR,
+                        on_click=lambda _e, cid=pk.credential_id: self.ui.page.run_task(self._revoke, cid),
+                    ),
+                    dense=True,
+                )
+            )
+        if update:
+            self.dialog.update()
 
-    def refresh(self) -> None:
-        self.list.clear()
-        for pk in self.manager.vault.passkeys():
-            fingerprint = pk.public_key[:16]
-            item = QListWidgetItem(f"{pk.label}   ·   pk {fingerprint}…   ·   {pk.created_at}")
-            item.setData(Qt.UserRole, pk.credential_id)
-            self.list.addItem(item)
-
-    def _run(self, action, ok_msg: str) -> None:
+    async def _act(self, fn, *args, message: str, ok: str) -> None:
         try:
-            with busy():
-                action()
+            await self.ui.run(fn, *args, message=message)
         except (VaultError, ApiError, NetworkError, ValueError) as exc:
-            self.status.setText(f"⚠ {exc}")
+            self.status.value = f"⚠ {exc}"
+            self.status.color = ft.Colors.ERROR
+        else:
+            self.status.value = ok
+            self.status.color = ft.Colors.GREEN
+            self.on_change()
+        self._refresh()
+
+    async def _create(self, _e) -> None:
+        label = (self.label.value or "").strip()[:64]
+        if not label:
+            self.status.value = "Escribe una etiqueta."
+            self.dialog.update()
             return
-        self.status.setText(ok_msg)
-        self.refresh()
+        self.label.value = ""
+        await self._act(self.manager.create_passkey, label,
+                        message="Generando par Ed25519 y registrando la llave pública…",
+                        ok="Passkey creada y guardada en la bóveda.")
 
-    def _create(self) -> None:
-        label, ok = QInputDialog.getText(self, "Nueva passkey", "Etiqueta (p. ej. «laptop»):")
-        if ok and label.strip():
-            self.changed = True
-            self._run(lambda: self.manager.create_passkey(label.strip()[:64]),
-                      "Passkey creada y guardada en la bóveda.")
-
-    def _revoke(self) -> None:
-        item = self.list.currentItem()
-        if item is None:
+    async def _revoke(self, credential_id: int) -> None:
+        if not await confirm(self.ui, "Revocar passkey", "El servidor dejará de aceptarla. ¿Continuar?",
+                             "Revocar", destructive=True):
             return
-        if QMessageBox.question(self, "Revocar", "¿Revocar esta passkey?") != QMessageBox.Yes:
-            return
-        self.changed = True
-        self._run(lambda: self.manager.revoke_passkey(item.data(Qt.UserRole)),
-                  "Passkey revocada en el servidor y eliminada de la bóveda.")
+        await self._act(self.manager.revoke_passkey, credential_id,
+                        message="Revocando…", ok="Passkey revocada en el servidor y eliminada de la bóveda.")
 
-    def _test(self) -> None:
-        self._run(self.manager.login_with_passkey,
-                  "Challenge firmado y verificado: el servidor emitió un token nuevo.")
+    async def _test(self, _e) -> None:
+        await self._act(self.manager.login_with_passkey, message="Firmando challenge…",
+                        ok="Challenge firmado y verificado: el servidor emitió un token nuevo.")
 
-
-def copy_to_clipboard(text: str) -> None:
-    # TODO (P1): limpiar el portapapeles tras N segundos.
-    QGuiApplication.clipboard().setText(text)
+    def show(self) -> None:
+        self.ui.page.show_dialog(self.dialog)

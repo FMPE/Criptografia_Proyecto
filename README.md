@@ -13,7 +13,7 @@ py -3.10 -m venv .venv
 .venv\Scripts\python -m server.scripts.gen_cert     # una vez
 .venv\Scripts\python -m server.app.main              # https://127.0.0.1:8443
 
-# Cliente de escritorio (otra terminal)
+# Cliente de escritorio, Flet 1.1.2 (otra terminal)
 .venv\Scripts\python -m client.ui.app
 
 # Pruebas y análisis estático
@@ -21,6 +21,11 @@ py -3.10 -m venv .venv
 .venv\Scripts\bandit -r client server
 .venv\Scripts\pip-audit -r requirements-client.txt -r requirements-server.txt
 ```
+
+La primera vez que se abre el cliente, `flet-desktop` descarga su aplicación nativa
+(unos segundos, una sola vez). Para esa descarga la app usa las CAs de `certifi`,
+porque el Python de Anaconda trae CAs desactualizadas. La conexión con el servidor
+propio no cambia: sigue confiando solo en `PM_CA_CERT`.
 
 Variables útiles: `PM_SERVER_URL`, `PM_CA_CERT`, `PM_HOME` (cliente);
 `PM_DATABASE_URL`, `PM_FAKE_SALT_KEY` (hex de 32 B), `PM_TOKEN_TTL` (servidor).
@@ -76,7 +81,18 @@ la passkey solo se usa con la bóveda ya abierta. Sirve para dos cosas:
 
 ## Estado
 
-- **P0 (hecho):** motor criptográfico, bóveda (crear/editar/duplicar/eliminar/buscar/filtrar por etiqueta), generador, servidor (registro, login, blob), TLS 1.3, UI PySide6, CI con bandit + semgrep + pip-audit.
+- **P0 (hecho):** motor criptográfico, bóveda (crear/editar/duplicar/eliminar/buscar/filtrar por etiqueta), generador, servidor (registro, login, blob), TLS 1.3, UI de escritorio en Flet, CI con bandit + semgrep + pip-audit.
 - **P1 (hecho):** passkeys Ed25519 con challenge-response (crear, revocar, renovar la sesión, desbloquear sin enviar AuthKey).
 - **P1 (pendiente):** verificación local anti-rollback (la versión ya está en el AAD, falta que el cliente recuerde la última versión vista), cambio de contraseña maestra, bloqueo automático y limpieza del portapapeles.
 - **P2:** certificate pinning por huella, padding del blob, exportación cifrada, Docker Compose.
+
+## Limitaciones conocidas de la UI
+
+- **Proceso de interfaz separado.** Flet dibuja la ventana en un proceso de Flutter
+  distinto del proceso de Python, y ambos se comunican por un canal local. Todo lo que
+  se ve en pantalla pasa por ese canal: entradas, contraseñas reveladas o copiadas y la
+  Secret Key del kit de emergencia. Un malware con acceso a la sesión del usuario ya
+  podría leer la pantalla o la memoria (ver "cliente comprometido" en el informe), pero
+  el canal es una superficie más que con una UI en un solo proceso.
+- **Limpieza del portapapeles pendiente (P1).** Todo copiado pasa por
+  [client/ui/clipboard.py](client/ui/clipboard.py); ahí va la limpieza temporizada.
