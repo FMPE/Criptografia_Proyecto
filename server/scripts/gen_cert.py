@@ -1,14 +1,19 @@
 """Genera un certificado TLS autofirmado (ECDSA P-256) para desarrollo.
 
-    python -m server.scripts.gen_cert
+    python -m server.scripts.gen_cert              # genera cert.pem, key.pem y pin.txt
+    python -m server.scripts.gen_cert --pin-only   # sólo calcula el pin del cert.pem actual
 
-Crea server/certs/cert.pem y server/certs/key.pem. El cliente confía
-explícitamente en cert.pem (PM_CA_CERT), no en el almacén de CAs del sistema.
+El cliente confía explícitamente en cert.pem (PM_CA_CERT) y además exige que la
+llave pública coincida con el pin de pin.txt (o PM_PINS):
+    pin = "sha256//" + Base64(SHA-256(SubjectPublicKeyInfo DER))
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
 import datetime
+import hashlib
 import ipaddress
 import os
 from pathlib import Path
@@ -21,7 +26,34 @@ from cryptography.x509.oid import NameOID
 CERT_DIR = Path(__file__).resolve().parents[1] / "certs"
 
 
+def spki_pin(cert: x509.Certificate) -> str:
+    # Mismo cálculo que client/net/pinning.py (el servidor no importa código del cliente).
+    spki = cert.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return "sha256//" + base64.b64encode(hashlib.sha256(spki).digest()).decode("ascii")
+
+
+def write_pin(cert: x509.Certificate) -> None:
+    pin = spki_pin(cert)
+    header = "# Pin SPKI del servidor (no es secreto). Distribúyelo con el cliente."
+    (CERT_DIR / "pin.txt").write_text(f"{header}\n{pin}\n", "utf-8")
+    print(f"Pin SPKI:    {pin}")
+    print(f"Guardado en: {CERT_DIR / 'pin.txt'}")
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--pin-only", action="store_true",
+                        help="calcula el pin del cert.pem existente sin regenerarlo")
+    args = parser.parse_args()
+    if args.pin_only:
+        cert_path = CERT_DIR / "cert.pem"
+        if not cert_path.exists():
+            raise SystemExit(f"No existe {cert_path}; ejecuta gen_cert sin --pin-only")
+        write_pin(x509.load_pem_x509_certificate(cert_path.read_bytes()))
+        return
+
     CERT_DIR.mkdir(parents=True, exist_ok=True)
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
@@ -72,6 +104,7 @@ def main() -> None:
     fp = cert.fingerprint(hashes.SHA256()).hex(":")
     print(f"Certificado: {CERT_DIR / 'cert.pem'}")
     print(f"SHA-256:     {fp}")
+    write_pin(cert)
 
 
 if __name__ == "__main__":

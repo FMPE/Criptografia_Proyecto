@@ -26,12 +26,35 @@ from .vault_view import VaultView
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def load_pins() -> list[str]:
+    """Pines SPKI: PM_PINS (separados por coma) o server/certs/pin.txt.
+
+    En un despliegue real el pin viaja con el cliente (no se lee del directorio del
+    servidor); leer pin.txt es una comodidad para el entorno de desarrollo.
+    """
+    env = os.environ.get("PM_PINS")
+    if env:
+        return [p.strip() for p in env.split(",") if p.strip()]
+    pin_file = Path(os.environ.get("PM_PIN_FILE", str(REPO_ROOT / "server" / "certs" / "pin.txt")))
+    if pin_file.exists():
+        lines = pin_file.read_text("utf-8").splitlines()
+        return [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+    raise SystemExit(
+        "No hay pin del servidor configurado. Ejecuta "
+        "'python -m server.scripts.gen_cert --pin-only' o define PM_PINS=sha256//…"
+    )
+
+
 def build_manager() -> VaultManager:
     url = os.environ.get("PM_SERVER_URL", "https://127.0.0.1:8443")
     ca = os.environ.get("PM_CA_CERT", str(REPO_ROOT / "server" / "certs" / "cert.pem"))
     if not Path(ca).exists():
         raise SystemExit(f"No se encontró el certificado del servidor: {ca}")
-    return VaultManager(ApiClient(url, ca_cert=ca))
+    try:
+        api = ApiClient(url, ca_cert=ca, pins=load_pins())
+    except ValueError as exc:
+        raise SystemExit(f"Configuración de pines inválida: {exc}")
+    return VaultManager(api)
 
 
 def make_main(manager: VaultManager):

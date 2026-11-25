@@ -10,7 +10,7 @@ py -3.10 -m venv .venv
 .venv\Scripts\pip install -r requirements-dev.txt
 
 # Servidor (TLS 1.3 con certificado autofirmado)
-.venv\Scripts\python -m server.scripts.gen_cert     # una vez
+.venv\Scripts\python -m server.scripts.gen_cert     # una vez: cert.pem, key.pem y pin.txt
 .venv\Scripts\python -m server.app.main              # https://127.0.0.1:8443
 
 # Cliente de escritorio, Flet 1.1.2 (otra terminal)
@@ -25,9 +25,9 @@ py -3.10 -m venv .venv
 La primera vez que se abre el cliente, `flet-desktop` descarga su aplicación nativa
 (unos segundos, una sola vez). Para esa descarga la app usa las CAs de `certifi`,
 porque el Python de Anaconda trae CAs desactualizadas. La conexión con el servidor
-propio no cambia: sigue confiando solo en `PM_CA_CERT`.
+propio no cambia: sigue confiando solo en `PM_CA_CERT` y en el pin.
 
-Variables útiles: `PM_SERVER_URL`, `PM_CA_CERT`, `PM_HOME` (cliente);
+Variables útiles: `PM_SERVER_URL`, `PM_CA_CERT`, `PM_PINS`, `PM_HOME` (cliente);
 `PM_DATABASE_URL`, `PM_FAKE_SALT_KEY` (hex de 32 B), `PM_TOKEN_TTL` (servidor).
 Por defecto el servidor usa SQLite; para PostgreSQL basta con
 `PM_DATABASE_URL=postgresql+psycopg://...`.
@@ -43,6 +43,7 @@ Por defecto el servidor usa SQLite; para PostgreSQL basta con
 | Blob de la bóveda con `AAD = "vault" ‖ versión ‖ user_id` | [client/vault/blob.py](client/vault/blob.py) |
 | Generador con `secrets` | [client/crypto/generator.py](client/crypto/generator.py) |
 | Flujos de registro / desbloqueo / guardado | [client/vault/manager.py](client/vault/manager.py) |
+| Anti-rollback: marca de agua con la versión más alta verificada (`max_version.json`) | [client/vault/storage.py](client/vault/storage.py), `_check_not_rolled_back` en [client/vault/manager.py](client/vault/manager.py) |
 | `Argon2id(AuthKey, salt_srv)`, tokens hasheados, rate limiting | [server/app/security.py](server/app/security.py) |
 | PUT con versión esperada atómica (409 si no coincide) | [server/app/vault.py](server/app/vault.py) |
 | Passkeys Ed25519: par generado en el cliente, privada guardada en la bóveda (bajo VK) | [client/crypto/passkeys.py](client/crypto/passkeys.py), [client/vault/models.py](client/vault/models.py) |
@@ -82,9 +83,49 @@ la passkey solo se usa con la bóveda ya abierta. Sirve para dos cosas:
 ## Estado
 
 - **P0 (hecho):** motor criptográfico, bóveda (crear/editar/duplicar/eliminar/buscar/filtrar por etiqueta), generador, servidor (registro, login, blob), TLS 1.3, UI de escritorio en Flet, CI con bandit + semgrep + pip-audit.
-- **P1 (hecho):** passkeys Ed25519 con challenge-response (crear, revocar, renovar la sesión, desbloquear sin enviar AuthKey).
-- **P1 (pendiente):** verificación local anti-rollback (la versión ya está en el AAD, falta que el cliente recuerde la última versión vista), cambio de contraseña maestra, bloqueo automático y limpieza del portapapeles.
-- **P2:** certificate pinning por huella, padding del blob, exportación cifrada, Docker Compose.
+- **P1 (hecho):** passkeys Ed25519 con challenge-response (crear, revocar, renovar la sesión, desbloquear sin enviar AuthKey); anti-rollback en el cliente.
+- **P1 (pendiente):** cambio de contraseña maestra, bloqueo automático y limpieza del portapapeles.
+- **P2 (hecho):** certificate pinning por llave pública (SPKI).
+- **P2 (pendiente):** padding del blob, exportación cifrada, Docker Compose.
+
+## Certificate pinning
+
+Además de validar la cadena, el nombre y TLS 1.3, el cliente exige que la **llave pública**
+del servidor coincida con un pin:
+
+    pin = "sha256//" + Base64(SHA-256(SubjectPublicKeyInfo DER))
+
+Es el mismo formato que HPKP y `curl --pinnedpubkey`. La comprobación ocurre justo después
+del handshake, antes de enviar cualquier byte HTTP
+([client/net/pinning.py](client/net/pinning.py)). Así, una CA comprometida o una CA de
+inspección TLS instalada en el equipo no alcanza para hacer MITM. Si el pin no coincide,
+el cliente lanza `CertificatePinningError` y **no** pasa al modo sin conexión: el usuario
+ve el aviso.
+
+- **Dónde está el pin:** `gen_cert` lo escribe en `server/certs/pin.txt`. Si ya tenías
+  certificado, `python -m server.scripts.gen_cert --pin-only` lo calcula sin regenerarlo.
+  El cliente lo lee de `PM_PINS` (separados por coma) o de ese archivo, y no arranca sin pin.
+  En un despliegue real el pin viaja con el cliente, no se lee del directorio del servidor.
+- **Rotación:** se fija la llave, no el certificado, así que renovar el certificado con la
+  misma llave no rompe el pin. Para cambiar de llave, se distribuye antes un pin de
+  respaldo (`PM_PINS=sha256//actual,sha256//respaldo`).
+- **Límite:** si se pierde la llave privada fijada y no hay pin de respaldo, los clientes
+  instalados dejan de conectarse hasta que se actualice su configuración.
+
+## Anti-rollback
+
+La versión de la bóveda va dentro del AAD, así que el servidor no puede cambiar el número
+sin invalidar el tag. Además, cada dispositivo guarda la versión más alta que ya verificó
+y rechaza (`RollbackError`) cualquier blob íntegro pero más viejo, en `unlock()` y en
+`pull()`. Si hay rollback no se modifica nada: ni la caché, ni la marca de agua, ni la
+bóveda en memoria.
+
+Límites conocidos:
+- **Dispositivo nuevo:** no tiene marca de agua, así que confía en la primera versión que ve.
+- **Congelamiento:** el servidor puede retener versiones nuevas y servir siempre la última
+  que el cliente ya vio. El rollback se detecta; la retención no (es un problema de disponibilidad).
+- **Archivo local:** `max_version.json` no está autenticado. Quien pueda escribir en el perfil
+  del usuario puede bajarlo, pero eso ya es un cliente comprometido.
 
 ## Limitaciones conocidas de la UI
 

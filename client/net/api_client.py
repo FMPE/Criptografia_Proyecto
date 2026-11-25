@@ -1,8 +1,8 @@
 """Cliente HTTPS del servidor de sincronización.
 
 Sólo se aceptan URLs https:// y el contexto TLS exige TLS 1.3 como mínimo.
-En desarrollo se confía explícitamente en el certificado autofirmado del
-servidor (`ca_cert`), no en todo el almacén de CAs del sistema.
+`ca_cert` fija en qué CA se confía (en desarrollo, el certificado autofirmado) y
+`pins` agrega certificate pinning por llave pública (ver `pinning.py`).
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import httpx
 from client.crypto.kdf import KdfParams
 from client.crypto.keys import WrappedKey
 from client.vault.blob import SealedVault
+
+from .pinning import PinMismatchError, normalize_pins, pinned_context
 
 
 class NetworkError(Exception):
@@ -40,6 +42,25 @@ class RateLimitedError(ApiError):
     pass
 
 
+class CertificatePinningError(ApiError):
+    """La llave del servidor no coincide con el pin: posible MITM. NO es "sin conexión"."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(0, detail)
+        self.args = (detail,)
+
+
+def _pin_failure(exc: BaseException) -> PinMismatchError | None:
+    """httpcore/httpx envuelven el error TLS (`raise ... from exc`): se busca en la cadena."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, PinMismatchError):
+            return exc
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 def _b64(b: bytes) -> str:
     return base64.b64encode(b).decode("ascii")
 
@@ -48,8 +69,8 @@ def _unb64(s: str) -> bytes:
     return base64.b64decode(s, validate=True)
 
 
-def make_tls_context(ca_cert: str | None) -> ssl.SSLContext:
-    ctx = ssl.create_default_context(cafile=ca_cert)
+def make_tls_context(ca_cert: str | None, pins: list[str] | None = None) -> ssl.SSLContext:
+    ctx = pinned_context(pins, ca_cert) if pins else ssl.create_default_context(cafile=ca_cert)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
@@ -63,12 +84,15 @@ class ApiClient:
         ca_cert: str | None = None,
         http_client: httpx.Client | None = None,
         timeout: float = 15.0,
+        pins: list[str] | None = None,
     ) -> None:
+        if pins is not None:
+            pins = sorted(normalize_pins(pins))  # falla rápido con pines mal formados
         if http_client is None:
             if not base_url.startswith("https://"):
                 raise ValueError("El cliente sólo se conecta por HTTPS")
             http_client = httpx.Client(
-                base_url=base_url, verify=make_tls_context(ca_cert), timeout=timeout
+                base_url=base_url, verify=make_tls_context(ca_cert, pins), timeout=timeout
             )
         self._http = http_client
         self.token: str | None = None
@@ -86,6 +110,10 @@ class ApiClient:
         try:
             resp = self._http.request(method, path, headers=headers, **kwargs)
         except httpx.TransportError as exc:
+            pin_error = _pin_failure(exc)
+            if pin_error is not None:
+                detail = pin_error.args[0] if pin_error.args else str(pin_error)
+                raise CertificatePinningError(str(detail)) from exc
             raise NetworkError(str(exc)) from exc
 
         if resp.status_code < 400:

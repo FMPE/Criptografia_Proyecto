@@ -80,6 +80,10 @@ class IntegrityError(VaultError):
     """El blob no pasó la verificación AEAD: fue alterado o no corresponde."""
 
 
+class RollbackError(VaultError):
+    """El servidor devolvió una versión más vieja que la que este dispositivo ya verificó."""
+
+
 class PasskeyUnavailableError(VaultError):
     """No hay passkey utilizable (dispositivo nuevo o bóveda sin passkeys)."""
 
@@ -158,6 +162,7 @@ class VaultManager:
         store.save_secret_key(secret_key)
         store.save_account(AccountInfo(email, salt_kdf, self.kdf_params))
         store.save_cache(CachedVault(sealed=sealed, wrapped_vk=wrapped))
+        store.record_version(sealed.version)
 
         self._set_state(email, store, vault, sealed, wrapped, vk, True, AUTH_PASSWORD)
         return format_secret_key(secret_key)
@@ -212,6 +217,7 @@ class VaultManager:
             sealed, wrapped = cache.sealed, cache.wrapped_vk
 
         vk, vault = self._open(keys.kek, wrapped, sealed, email)
+        self._check_not_rolled_back(store, sealed)
 
         # Sólo se persiste en disco lo que ya se verificó criptográficamente.
         if new_device:
@@ -237,6 +243,7 @@ class VaultManager:
         check_params(account.kdf_params)
         keys = derive_keys(password, store.load_secret_key(), account.salt_kdf, account.kdf_params)
         vk, vault = self._open(keys.kek, cache.wrapped_vk, cache.sealed, email)
+        self._check_not_rolled_back(store, cache.sealed)
         if vault.latest_passkey() is None:
             raise PasskeyUnavailableError("La bóveda no tiene passkeys registradas")
 
@@ -251,7 +258,27 @@ class VaultManager:
             self._reset()
             raise
         self.online = True
-        self.pull()  # baja la versión del servidor, la verifica y la cachea
+        try:
+            self.pull()  # baja la versión del servidor, la verifica y la cachea
+        except RollbackError:
+            self._reset()
+            raise
+
+    @staticmethod
+    def _check_not_rolled_back(store: LocalStore, sealed: SealedVault) -> None:
+        """Anti-rollback: rechaza versiones menores a la más alta ya verificada aquí.
+
+        Se llama sólo DESPUÉS de validar el tag AEAD: la versión va dentro del AAD,
+        así que el número ya está autenticado y el servidor no pudo cambiarlo.
+        Si hay rollback no se toca nada (caché, marca de agua ni estado en memoria).
+        """
+        seen = store.load_max_version()
+        if sealed.version < seen:
+            raise RollbackError(
+                f"Posible ataque de rollback: el servidor devolvió la versión v{sealed.version}, "
+                f"pero este dispositivo ya verificó la v{seen}"
+            )
+        store.record_version(sealed.version)
 
     def _open(self, kek: bytes, wrapped, sealed: SealedVault, email: str) -> tuple[bytes, Vault]:
         try:
@@ -364,6 +391,7 @@ class VaultManager:
 
         self.version = sealed.version
         self.store.save_cache(CachedVault(sealed=sealed, wrapped_vk=self._wrapped_vk))
+        self.store.record_version(sealed.version)
         return self.version
 
     def pull(self) -> None:
@@ -374,9 +402,11 @@ class VaultManager:
         except NetworkError:
             raise OfflineError("No se pudo contactar al servidor")
         try:
-            self.vault = open_vault(self._vk, sealed, self.email)
+            vault = open_vault(self._vk, sealed, self.email)
         except aead.DecryptionError:
             raise IntegrityError("La bóveda no pasó la verificación de integridad")
+        self._check_not_rolled_back(self.store, sealed)
+        self.vault = vault
         self.version = sealed.version
         self._wrapped_vk = wrapped
         self.store.save_cache(CachedVault(sealed=sealed, wrapped_vk=wrapped))
@@ -399,6 +429,7 @@ __all__ = [
     "SyncConflictError",
     "SessionExpiredError",
     "IntegrityError",
+    "RollbackError",
     "PasskeyUnavailableError",
     "PasskeyAuthError",
     "normalize_email",

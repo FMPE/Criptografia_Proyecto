@@ -6,6 +6,7 @@ from typing import Callable
 
 import flet as ft
 
+from client.net.api_client import ApiError, NetworkError
 from client.vault.manager import VaultError, VaultManager
 from client.vault.models import Entry
 
@@ -323,7 +324,7 @@ class VaultView:
     async def _sync(self, ok_message: str) -> None:
         try:
             await self.ui.run(self.manager.save, message="Cifrando y subiendo la bóveda…")
-        except VaultError as exc:
+        except (VaultError, ApiError, NetworkError) as exc:
             self.ui.notify(str(exc), error=True)
         else:
             self.dirty = False
@@ -343,7 +344,7 @@ class VaultView:
             return
         try:
             await self.ui.run(self.manager.pull, message="Descargando y verificando la bóveda…")
-        except VaultError as exc:
+        except (VaultError, ApiError, NetworkError) as exc:
             self.ui.notify(str(exc), error=True)
             return
         self.dirty = False

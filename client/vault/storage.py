@@ -144,3 +144,25 @@ class LocalStore:
             ),
             pending=bool(doc.get("pending", False)),
         )
+
+    # ---- Anti-rollback ---------------------------------------------------- #
+    # Versión más alta de la bóveda que este dispositivo ya verificó (tag AEAD
+    # válido, con la versión dentro del AAD). Un servidor que devuelva una versión
+    # menor está haciendo rollback/replay de un blob viejo.
+    @property
+    def _max_version_path(self) -> Path:
+        return self.dir / "max_version.json"
+
+    def load_max_version(self) -> int:
+        path = self._max_version_path
+        if not path.exists():
+            return 0
+        return int(json.loads(path.read_text("utf-8"))["max_version"])
+
+    def record_version(self, version: int) -> int:
+        """Sube la marca de agua a `version` si es mayor. Nunca la baja."""
+        current = self.load_max_version()
+        if version > current:
+            _write_private(self._max_version_path, json.dumps({"max_version": version}).encode())
+            return version
+        return current

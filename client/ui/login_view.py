@@ -8,7 +8,7 @@ import flet as ft
 
 from client.crypto.generator import estimate_password_entropy
 from client.crypto.keys import InvalidSecretKeyError
-from client.net.api_client import ApiError, NetworkError
+from client.net.api_client import ApiError, CertificatePinningError, NetworkError
 from client.vault.manager import (
     MIN_MASTER_ENTROPY_BITS,
     MIN_MASTER_LENGTH,
@@ -157,6 +157,8 @@ class LoginView:
             return
         except (VaultError, InvalidSecretKeyError, ValueError) as exc:
             return self._fail(str(exc))
+        except CertificatePinningError as exc:
+            return self._fail(str(exc))
         except (ApiError, NetworkError) as exc:
             return self._fail(f"Error del servidor: {exc}")
         finally:
@@ -175,6 +177,8 @@ class LoginView:
                 message="Generando Secret Key y derivando llaves…",
             )
         except (VaultError, ValueError) as exc:
+            return self._fail(str(exc))
+        except CertificatePinningError as exc:
             return self._fail(str(exc))
         except (ApiError, NetworkError) as exc:
             return self._fail(f"Error del servidor: {exc}")

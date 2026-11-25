@@ -60,6 +60,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def make_server_config(app: FastAPI, certfile: str, keyfile: str, host: str, port: int, **kwargs):
+    """Configuración de uvicorn con TLS 1.3 obligatorio (la reusan `run()` y las pruebas)."""
+    import uvicorn
+
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        ssl_certfile=certfile,
+        ssl_keyfile=keyfile,
+        server_header=False,
+        proxy_headers=False,
+        **kwargs,
+    )
+    config.load()
+    # Se exige TLS 1.3: sin downgrade a TLS 1.2 o anteriores.
+    config.ssl.minimum_version = ssl.TLSVersion.TLSv1_3
+    return config
+
+
 def run() -> None:
     import uvicorn
 
@@ -70,18 +90,13 @@ def run() -> None:
             "No hay certificado TLS. Ejecuta primero: python -m server.scripts.gen_cert"
         )
 
-    config = uvicorn.Config(
+    config = make_server_config(
         create_app(),
+        certfile,
+        keyfile,
         host=os.environ.get("PM_HOST", "127.0.0.1"),
         port=int(os.environ.get("PM_PORT", "8443")),
-        ssl_certfile=certfile,
-        ssl_keyfile=keyfile,
-        server_header=False,
-        proxy_headers=False,
     )
-    config.load()
-    # Se exige TLS 1.3: sin downgrade a TLS 1.2 o anteriores.
-    config.ssl.minimum_version = ssl.TLSVersion.TLSv1_3
     uvicorn.Server(config).run()
 
 
