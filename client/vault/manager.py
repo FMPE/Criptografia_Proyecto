@@ -7,6 +7,7 @@ La UI sólo habla con `VaultManager`.
 from __future__ import annotations
 
 import base64
+import hmac
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -244,8 +245,15 @@ class VaultManager:
                 "La passkey sólo sirve en un dispositivo donde ya se abrió la bóveda"
             )
         check_params(account.kdf_params)
-        keys = derive_keys(password, store.load_secret_key(), account.salt_kdf, account.kdf_params)
-        vk, vault = self._open(keys.kek, cache.wrapped_vk, cache.sealed, email)
+        secret_key = store.load_secret_key()
+        keys = derive_keys(password, secret_key, account.salt_kdf, account.kdf_params)
+        try:
+            vk, vault = self._open(keys.kek, cache.wrapped_vk, cache.sealed, email)
+        except WrongCredentialsError:
+            raise WrongCredentialsError(
+                "Contraseña maestra incorrecta. Si la cambiaste en otro dispositivo, "
+                "desbloquea una vez sin passkey con la contraseña actual."
+            )
         self._check_not_rolled_back(store, cache.sealed)
         if vault.latest_passkey() is None:
             raise PasskeyUnavailableError("La bóveda no tiene passkeys registradas")
@@ -263,9 +271,42 @@ class VaultManager:
         self.online = True
         try:
             self.pull()  # baja la versión del servidor, la verifica y la cachea
-        except RollbackError:
+            self._confirm_current_password(email, password, secret_key, account, keys.kek)
+        except (VaultError, ApiError):
             self._reset()
             raise
+
+    def _confirm_current_password(
+        self, email: str, password: str, secret_key: bytes, account: AccountInfo, local_kek: bytes
+    ) -> None:
+        """Tras un login con passkey, exige que la contraseña escrita sea la VIGENTE.
+
+        La caché local puede estar envuelta con una contraseña ya cambiada en otro
+        dispositivo. Sin esta comprobación, esa contraseña vieja + la passkey darían
+        una sesión en línea. Se deriva con el salt/parámetros actuales del servidor y se
+        desenvuelve la VK envuelta recién descargada (`pull()` la dejó en `_wrapped_vk`).
+        Si funciona, se actualiza `account.json` para que el próximo desbloqueo use el
+        salt correcto.
+        """
+        try:
+            salt_kdf, params = self.api.get_kdf_params(email)
+        except NetworkError:
+            raise OfflineError("No se pudo contactar al servidor")
+        check_params(params)  # los parámetros vienen de un servidor no confiable
+        if salt_kdf == account.salt_kdf and params == account.kdf_params:
+            kek = local_kek  # no cambió nada: se evita una segunda derivación Argon2id
+        else:
+            kek = derive_keys(password, secret_key, salt_kdf, params).kek
+        try:
+            current_vk = unwrap_vault_key(kek, self._wrapped_vk, email)
+        except aead.DecryptionError:
+            current_vk = None
+        if current_vk is None or not hmac.compare_digest(current_vk, self._vk):
+            raise WrongCredentialsError(
+                "La contraseña maestra cambió en otro dispositivo: desbloquea sin passkey "
+                "con la contraseña actual."
+            )
+        self.store.save_account(AccountInfo(email, salt_kdf, params))
 
     @staticmethod
     def _check_not_rolled_back(store: LocalStore, sealed: SealedVault) -> None:

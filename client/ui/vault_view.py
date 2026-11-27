@@ -343,8 +343,11 @@ class VaultView:
         ExportDialog(self.ui, self.manager).show()
 
     async def _open_import(self, _e) -> None:
-        def done() -> None:
-            self.dirty = False  # import_backup sube la bóveda
+        def done(added: int) -> None:
+            # import_backup sólo llama a save() si agregó entradas: con 0, los cambios
+            # pendientes que hubiera siguen sin subir.
+            if added:
+                self.dirty = False
             self.refresh()
 
         await pick_and_import(self.ui, self.manager, done)

@@ -229,7 +229,7 @@ class ExportDialog(_FormDialog):
 
 
 class ImportDialog(_FormDialog):
-    def __init__(self, ui: Ui, manager: VaultManager, path: Path, on_done: Callable[[], None]) -> None:
+    def __init__(self, ui: Ui, manager: VaultManager, path: Path, on_done: Callable[[int], None]) -> None:
         self.manager = manager
         self.path = path
         self.on_done = on_done
@@ -251,11 +251,12 @@ class ImportDialog(_FormDialog):
             return self.fail(str(exc))
         self.pw.value = ""
         self.ui.page.pop_dialog()
-        self.on_done()
+        self.on_done(n)
         self.ui.notify(f"Se importaron {n} entradas" if n else "No había entradas nuevas que importar")
 
 
-async def pick_and_import(ui: Ui, manager: VaultManager, on_done: Callable[[], None]) -> None:
+async def pick_and_import(ui: Ui, manager: VaultManager, on_done: Callable[[int], None]) -> None:
+    """`on_done(n)` recibe cuántas entradas se agregaron (0: no se subió nada)."""
     if not manager.online:
         ui.notify("Sin conexión: la bóveda es de sólo lectura", error=True)
         return

@@ -336,3 +336,64 @@ def test_api_rejects_passkey_calls_without_session(account):
     account.api.logout()
     with pytest.raises(AuthError):
         account.api.list_passkeys()
+
+
+# =========================================================================== #
+# Passkey + cambio de contraseña hecho en OTRO dispositivo
+# =========================================================================== #
+NEW_PW = "0tra-Clave-Muy-Larga#9"
+
+
+@pytest.fixture
+def changed_elsewhere(manager_factory, tmp_path):
+    """El dispositivo A tiene passkey y está bloqueado; el B cambia la contraseña maestra."""
+    a = manager_factory(tmp_path / "a")
+    sk_text = a.register("otra@utec.edu.pe", PW)
+    a.create_passkey("laptop")
+    a.lock()
+    b = manager_factory(tmp_path / "b")
+    b.unlock("otra@utec.edu.pe", PW, sk_text)
+    b.change_password(PW, NEW_PW)
+    b.lock()
+    return tmp_path / "a", "otra@utec.edu.pe"
+
+
+def test_old_password_plus_passkey_is_rejected_after_remote_change(changed_elsewhere, manager_factory):
+    home, email = changed_elsewhere
+    m = manager_factory(home)
+    with pytest.raises(WrongCredentialsError, match="cambió en otro dispositivo"):
+        m.unlock(email, PW, use_passkey=True)
+    assert not m.is_unlocked
+    # Tampoco queda una segunda oportunidad: la caché ya tiene la VK envuelta nueva.
+    with pytest.raises(WrongCredentialsError):
+        manager_factory(home).unlock(email, PW, use_passkey=True)
+
+
+def test_new_password_with_passkey_needs_one_normal_unlock(changed_elsewhere, manager_factory):
+    home, email = changed_elsewhere
+    with pytest.raises(WrongCredentialsError, match="desbloquea una vez sin passkey"):
+        manager_factory(home).unlock(email, NEW_PW, use_passkey=True)
+
+    normal = manager_factory(home)
+    normal.unlock(email, NEW_PW)  # actualiza salt y VK envuelta locales
+    normal.lock()
+
+    m = manager_factory(home)
+    m.unlock(email, NEW_PW, use_passkey=True)
+    assert m.is_unlocked and m.auth_method == "passkey"
+    m.lock()
+    with pytest.raises(WrongCredentialsError):
+        manager_factory(home).unlock(email, PW, use_passkey=True)
+
+
+def test_passkey_unlock_without_changes_derives_only_once(account, manager_factory, monkeypatch):
+    account.create_passkey("laptop")
+    home = account.home
+    account.lock()
+    import client.vault.manager as mgr_mod
+
+    calls = []
+    real = mgr_mod.derive_keys
+    monkeypatch.setattr(mgr_mod, "derive_keys", lambda *a, **k: calls.append(1) or real(*a, **k))
+    manager_factory(home).unlock(EMAIL, PW, use_passkey=True)
+    assert len(calls) == 1  # salt y parámetros iguales: se reutiliza la KEK local
