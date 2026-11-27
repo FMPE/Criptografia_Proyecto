@@ -7,6 +7,8 @@ La UI sólo habla con `VaultManager`.
 from __future__ import annotations
 
 import base64
+import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -31,6 +33,7 @@ from client.net.api_client import (
 )
 
 from .blob import SealedVault, open_vault, seal_vault
+from .export import export_vault, import_vault
 from .models import Passkey, Vault
 from .storage import AccountInfo, CachedVault, LocalStore
 
@@ -99,13 +102,13 @@ def normalize_email(email: str) -> str:
     return email
 
 
-def check_master_password(password: str) -> None:
+def check_master_password(password: str, what: str = "La contraseña maestra") -> None:
     if len(password) < MIN_MASTER_LENGTH:
         raise WeakMasterPasswordError(
-            f"La contraseña maestra debe tener al menos {MIN_MASTER_LENGTH} caracteres"
+            f"{what} debe tener al menos {MIN_MASTER_LENGTH} caracteres"
         )
     if estimate_password_entropy(password) < MIN_MASTER_ENTROPY_BITS:
-        raise WeakMasterPasswordError("La contraseña maestra es demasiado predecible")
+        raise WeakMasterPasswordError(f"{what} es demasiado predecible")
 
 
 class VaultManager:
@@ -289,6 +292,102 @@ class VaultManager:
             return vk, open_vault(vk, sealed, email)
         except aead.DecryptionError:
             raise IntegrityError("La bóveda no pasó la verificación de integridad")
+
+    # ------------------------------------------------------------------ #
+    # Cambio de contraseña maestra
+    # ------------------------------------------------------------------ #
+    def change_password(self, old_password: str, new_password: str) -> None:
+        """Cambia la contraseña maestra sin re-cifrar la bóveda.
+
+        Se derivan AuthKey y KEK nuevas (con un salt_kdf nuevo; la Secret Key no cambia)
+        y sólo se re-envuelve la VK (32 B). El blob sigue igual: misma VK, misma versión.
+        El servidor verifica la AuthKey actual, guarda Argon2id(AuthKey nueva) y revoca
+        todas las sesiones activas de la cuenta; este dispositivo recibe un token nuevo.
+        """
+        self._require_online()
+        if old_password == new_password:
+            raise WeakMasterPasswordError("La contraseña nueva debe ser distinta de la actual")
+        check_master_password(new_password, "La contraseña nueva")
+        check_params(self.kdf_params)
+        secret_key = self.store.load_secret_key()
+
+        try:
+            salt_kdf, params = self.api.get_kdf_params(self.email)
+        except NetworkError:
+            raise OfflineError("No se pudo contactar al servidor")
+        check_params(params)
+        old_keys = derive_keys(old_password, secret_key, salt_kdf, params)
+
+        new_salt = generate_salt_kdf()
+        new_keys = derive_keys(new_password, secret_key, new_salt, self.kdf_params)
+        new_wrapped = wrap_vault_key(new_keys.kek, self._vk, self.email)
+
+        try:
+            self._authenticated(
+                lambda: self.api.change_password(
+                    old_keys.auth_key, new_keys.auth_key, new_salt, self.kdf_params, new_wrapped
+                )
+            )
+        except NetworkError:
+            raise OfflineError("No se pudo contactar al servidor")
+        except ApiError as exc:
+            if exc.status == 403:
+                raise WrongCredentialsError("La contraseña actual no es correcta")
+            raise
+
+        # El servidor ya aceptó: se actualiza lo local para que el desbloqueo sin
+        # conexión use la contraseña nueva (y deje de aceptar la vieja).
+        self._wrapped_vk = new_wrapped
+        self.store.save_account(AccountInfo(self.email, new_salt, self.kdf_params))
+        cache = self.store.load_cache()
+        if cache is not None:
+            self.store.save_cache(
+                CachedVault(sealed=cache.sealed, wrapped_vk=new_wrapped, pending=cache.pending)
+            )
+        self.auth_method = AUTH_PASSWORD
+
+    # ------------------------------------------------------------------ #
+    # Exportación / importación cifrada
+    # ------------------------------------------------------------------ #
+    def export_backup(self, path: Path, backup_password: str) -> int:
+        """Escribe un respaldo cifrado con una contraseña propia. Devuelve cuántas entradas."""
+        self._require_unlocked()
+        check_master_password(backup_password, "La contraseña de respaldo")
+        data = export_vault(self.vault, backup_password, self.kdf_params)
+        Path(path).write_bytes(data)
+        return len(self.vault)
+
+    def import_backup(self, path: Path, backup_password: str) -> int:
+        """Agrega a la bóveda las entradas de un respaldo y la sube. Devuelve cuántas se agregaron.
+
+        Las entradas con un id que ya existe se omiten si son idénticas y, si difieren,
+        se agregan como entradas nuevas (nunca se sobrescribe nada).
+        """
+        self._require_online()
+        entries = import_vault(Path(path).read_bytes(), backup_password)
+        added: list[str] = []
+        for e in entries:
+            if not e.service.strip():
+                continue
+            try:
+                current = self.vault.get(e.id)
+            except KeyError:
+                current = None
+            if current is not None:
+                if current == e:
+                    continue
+                e = replace(e, id=str(uuid.uuid4()))
+            self.vault.add(e)
+            added.append(e.id)
+        if not added:
+            return 0
+        try:
+            self.save()
+        except VaultError:
+            for eid in added:  # no se deja la bóveda en memoria distinta de la guardada
+                self.vault.delete(eid)
+            raise
+        return len(added)
 
     # ------------------------------------------------------------------ #
     # Passkeys

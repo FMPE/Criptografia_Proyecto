@@ -10,6 +10,7 @@ from client.net.api_client import ApiError, NetworkError
 from client.vault.manager import VaultError, VaultManager
 from client.vault.models import Entry
 
+from .account_dialogs import ChangePasswordDialog, ExportDialog, PreferencesDialog, pick_and_import
 from .async_ops import Ui
 from .clipboard import copy_to_clipboard
 from .dialogs import GeneratorDialog, PasskeysDialog, confirm
@@ -52,6 +53,20 @@ class VaultView:
                     ft.IconButton(ft.Icons.REFRESH, tooltip="Recargar del servidor", on_click=self._pull),
                     ft.IconButton(ft.Icons.AUTO_AWESOME, tooltip="Generador", on_click=self._open_generator),
                     ft.IconButton(ft.Icons.FINGERPRINT, tooltip="Passkeys", on_click=self._open_passkeys),
+                    ft.PopupMenuButton(
+                        icon=ft.Icons.MANAGE_ACCOUNTS,
+                        tooltip="Cuenta y seguridad",
+                        items=[
+                            ft.PopupMenuItem(content="Cambiar contraseña maestra", icon=ft.Icons.PASSWORD,
+                                             on_click=self._open_change_password),
+                            ft.PopupMenuItem(content="Exportar respaldo cifrado", icon=ft.Icons.FILE_UPLOAD_OUTLINED,
+                                             on_click=self._open_export),
+                            ft.PopupMenuItem(content="Importar respaldo cifrado", icon=ft.Icons.FILE_DOWNLOAD_OUTLINED,
+                                             on_click=self._open_import),
+                            ft.PopupMenuItem(content="Bloqueo y portapapeles", icon=ft.Icons.TIMER_OUTLINED,
+                                             on_click=self._open_preferences),
+                        ],
+                    ),
                     ft.IconButton(ft.Icons.LOCK, tooltip="Bloquear", on_click=self._lock),
                 ],
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -318,6 +333,25 @@ class VaultView:
 
         PasskeysDialog(self.ui, self.manager, on_change=changed).show()
 
+    def _open_change_password(self, _e) -> None:
+        if not self.manager.online:
+            self.ui.notify("Sin conexión: no se puede cambiar la contraseña", error=True)
+            return
+        ChangePasswordDialog(self.ui, self.manager, on_done=self.refresh).show()
+
+    def _open_export(self, _e) -> None:
+        ExportDialog(self.ui, self.manager).show()
+
+    async def _open_import(self, _e) -> None:
+        def done() -> None:
+            self.dirty = False  # import_backup sube la bóveda
+            self.refresh()
+
+        await pick_and_import(self.ui, self.manager, done)
+
+    def _open_preferences(self, _e) -> None:
+        PreferencesDialog(self.ui, self.manager.home).show()
+
     # ------------------------------------------------------------------ #
     # Sincronización
     # ------------------------------------------------------------------ #
@@ -358,5 +392,6 @@ class VaultView:
         ):
             return
         self._clear_form()
+        await self.ui.clipboard_guard.clear_if_ours()
         self.manager.lock()
         self.on_locked()

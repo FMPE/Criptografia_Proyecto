@@ -15,13 +15,24 @@ from typing import Any, Callable, TypeVar
 
 import flet as ft
 
+from .clipboard import ClipboardGuard
+from .idle import InactivityMonitor
+from .preferences import Preferences
+
 T = TypeVar("T")
 
 
 class Ui:
-    def __init__(self, page: ft.Page) -> None:
+    def __init__(self, page: ft.Page, prefs: Preferences | None = None) -> None:
         self.page = page
+        self.prefs = prefs or Preferences()
         self.clipboard = ft.Clipboard()
+        self.file_picker = ft.FilePicker()
+        self.clipboard_guard = ClipboardGuard(
+            self.clipboard.get, self.clipboard.set, self.prefs.clipboard_clear_seconds
+        )
+        # `on_idle` lo asigna app.py (sabe cómo bloquear y volver al login).
+        self.idle = InactivityMonitor(self.prefs.auto_lock_seconds, self._noop)
         self._busy_text = ft.Text("", size=15)
         self._busy = ft.Container(
             content=ft.Column(
@@ -38,13 +49,36 @@ class Ui:
         )
         page.overlay.append(self._busy)
 
+    @staticmethod
+    async def _noop() -> None:
+        return None
+
+    def touch(self, *_args) -> None:
+        """Actividad del usuario: reinicia el temporizador de bloqueo automático."""
+        self.idle.touch()
+
+    def apply_preferences(self, prefs: Preferences) -> None:
+        self.prefs = prefs
+        self.idle.set_timeout(prefs.auto_lock_seconds)
+        self.clipboard_guard.clear_after = prefs.clipboard_clear_seconds
+
+    def close_dialogs(self) -> None:
+        """Cierra todos los diálogos abiertos (p. ej. al bloquear por inactividad)."""
+        for _ in range(20):
+            if self.page.pop_dialog() is None:
+                break
+
     async def run(self, fn: Callable[..., T], *args: Any, message: str = "Procesando…", **kwargs: Any) -> T:
-        """Ejecuta `fn` en un hilo mostrando la capa de espera. Propaga sus excepciones."""
+        """Ejecuta `fn` en un hilo mostrando la capa de espera. Propaga sus excepciones.
+
+        Mientras corre no cuenta como inactividad (Argon2id puede tardar segundos).
+        """
         self._busy_text.value = message
         self._busy.visible = True
         self.page.update()
         try:
-            return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
+            with self.idle.busy():
+                return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
         finally:
             self._busy.visible = False
             self.page.update()

@@ -64,6 +64,19 @@ class LoginIn(BaseModel):
     auth_key: str
 
 
+class ChangePasswordIn(BaseModel):
+    """Cambio de contraseña maestra: sólo cambian AuthKey, salt_kdf/parámetros y la VK envuelta.
+
+    El blob de la bóveda NO viaja: sigue cifrado con la misma VK.
+    """
+
+    old_auth_key: str  # prueba de que se conoce la contraseña actual (no basta el token)
+    new_auth_key: str
+    salt_kdf: str
+    kdf_params: KdfParamsIn
+    wrapped_vk: WrappedKeyIO
+
+
 class TokenOut(BaseModel):
     token: str
     token_type: str = "bearer"

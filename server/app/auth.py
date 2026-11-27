@@ -7,12 +7,13 @@ import hashlib
 import hmac
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .db import get_db
-from .models import User, VaultBlob
+from .models import SessionToken, User, VaultBlob
 from .schemas import (
+    ChangePasswordIn,
     KdfParamsIn,
     KdfParamsOut,
     LoginIn,
@@ -21,7 +22,7 @@ from .schemas import (
     decode_b64,
     normalize_email,
 )
-from .security import client_ip, issue_token
+from .security import client_ip, current_user, issue_token
 
 router = APIRouter(tags=["auth"])
 
@@ -133,6 +134,61 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)) -> Tok
             headers={"WWW-Authenticate": "Bearer"},
         )
     limiter.success(ip, body.email)
+    token = issue_token(db, user, settings.token_ttl_seconds)
+    db.commit()
+    return TokenOut(token=token, expires_in=settings.token_ttl_seconds)
+
+
+@router.post("/account/password", response_model=TokenOut)
+def change_password(
+    body: ChangePasswordIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> TokenOut:
+    """Cambia la contraseña maestra: nuevo hash de AuthKey, nuevo salt_kdf y VK re-envuelta.
+
+    - Además del token se exige la AuthKey actual: un token robado no basta para
+      apropiarse de la cuenta. Los fallos cuentan para el mismo rate limiting del login.
+    - La bóveda (tabla `vaults`) no se toca: la VK es la misma.
+    - Se invalidan TODAS las sesiones activas de la cuenta (todos los dispositivos) y se
+      emite un token nuevo sólo para quien hizo el cambio.
+    """
+    settings = request.app.state.settings
+    limiter = request.app.state.rate_limiter
+    hasher = request.app.state.hasher
+    ip = client_ip(request)
+    limiter.check(ip, user.email)
+
+    try:
+        old_auth_key = decode_b64(body.old_auth_key, exact=32)
+        new_auth_key = decode_b64(body.new_auth_key, exact=32)
+        salt_kdf = decode_b64(body.salt_kdf, exact=16)
+        wvk_nonce = decode_b64(body.wrapped_vk.nonce, exact=NONCE_SIZE)
+        wvk = decode_b64(body.wrapped_vk.ciphertext, exact=VK_WRAPPED_SIZE)
+    except ValueError as exc:
+        raise _bad_request(str(exc))
+    p = body.kdf_params
+    if p.memory_kib < settings.min_client_memory_kib or p.time_cost < settings.min_client_time_cost:
+        raise _bad_request("Parámetros de Argon2id por debajo del mínimo")
+
+    if not hasher.verify(user.auth_hash, old_auth_key):
+        limiter.fail(ip, user.email)
+        # 403 y no 401: el token es válido, lo que falla es la contraseña actual.
+        # Así el cliente no lo confunde con una sesión expirada.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "La contraseña actual no es correcta")
+    limiter.success(ip, user.email)
+    if hasher.verify(user.auth_hash, new_auth_key):
+        raise _bad_request("La contraseña nueva debe ser distinta de la actual")
+
+    user.auth_hash = hasher.hash(new_auth_key)
+    user.salt_kdf = salt_kdf
+    user.kdf_memory_kib, user.kdf_time_cost, user.kdf_parallelism = (
+        p.memory_kib, p.time_cost, p.parallelism,
+    )
+    user.wrapped_vk_nonce, user.wrapped_vk = wvk_nonce, wvk
+    # Todas las sesiones previas quedan revocadas (incluida la que hizo la petición).
+    db.execute(delete(SessionToken).where(SessionToken.user_id == user.id))
     token = issue_token(db, user, settings.token_ttl_seconds)
     db.commit()
     return TokenOut(token=token, expires_in=settings.token_ttl_seconds)
