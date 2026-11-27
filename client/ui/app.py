@@ -21,6 +21,7 @@ from client.vault.manager import VaultManager
 from .async_ops import Ui
 from .dialogs import confirm, show_emergency_kit
 from .login_view import LoginView
+from .preferences import load_preferences
 from .vault_view import VaultView
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -67,15 +68,23 @@ def make_main(manager: VaultManager):
         page.window.width, page.window.height = 1120, 720
         page.window.min_width, page.window.min_height = 860, 560
 
-        ui = Ui(page)
+        ui = Ui(page, load_preferences(manager.home))
         state: dict = {"vault": None}
 
         def show(control: ft.Control) -> None:
             page.controls.clear()
-            page.add(control)
+            # Toda la ventana reporta actividad (mouse y rueda) al temporizador de
+            # bloqueo; hover/scroll no compiten con los gestos de los controles hijos.
+            page.add(
+                ft.GestureDetector(
+                    content=control, expand=True, hover_interval=1000,
+                    on_hover=ui.touch, on_enter=ui.touch, on_scroll=ui.touch,
+                )
+            )
             page.update()
 
         def show_login() -> None:
+            ui.idle.stop()
             state["vault"] = None
             show(LoginView(ui, manager, on_unlocked=show_vault).control)
 
@@ -83,8 +92,27 @@ def make_main(manager: VaultManager):
             view = VaultView(ui, manager, on_locked=show_login)
             state["vault"] = view
             show(view.control)
+            ui.idle.start()
             if secret_key:
                 show_emergency_kit(ui, manager.email, secret_key)
+
+        async def on_idle() -> None:
+            """Bloqueo automático: se olvidan las llaves aunque haya cambios sin subir."""
+            if state["vault"] is None or not manager.is_unlocked:
+                return
+            lost = state["vault"].dirty
+            ui.close_dialogs()
+            await ui.clipboard_guard.clear_if_ours()
+            manager.lock()
+            show_login()
+            ui.notify(
+                "Bóveda bloqueada por inactividad"
+                + (" (se descartaron cambios sin subir)" if lost else ""),
+                error=lost,
+            )
+
+        ui.idle.on_idle = on_idle
+        page.on_keyboard_event = ui.touch
 
         # Cerrar la ventana bloquea la bóveda; avisa si hay cambios sin subir.
         async def on_window_event(e) -> None:
@@ -95,6 +123,8 @@ def make_main(manager: VaultManager):
                 ui, "Salir", "Hay cambios sin subir que se perderán. ¿Salir igual?", "Salir", destructive=True
             ):
                 return
+            ui.idle.stop()
+            await ui.clipboard_guard.clear_if_ours()
             manager.lock()
             await page.window.destroy()
 

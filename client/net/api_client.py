@@ -171,6 +171,33 @@ class ApiClient:
         self.token = data["token"]
         return self.token
 
+    def change_password(
+        self,
+        old_auth_key: bytes,
+        new_auth_key: bytes,
+        salt_kdf: bytes,
+        kdf_params: KdfParams,
+        wrapped_vk: WrappedKey,
+    ) -> str:
+        """Sube AuthKey, salt y VK envuelta nuevos. El servidor revoca las demás sesiones."""
+        data = self._request(
+            "POST",
+            "/account/password",
+            auth=True,
+            json={
+                "old_auth_key": _b64(old_auth_key),
+                "new_auth_key": _b64(new_auth_key),
+                "salt_kdf": _b64(salt_kdf),
+                "kdf_params": kdf_params.to_dict(),
+                "wrapped_vk": {
+                    "nonce": _b64(wrapped_vk.nonce),
+                    "ciphertext": _b64(wrapped_vk.ciphertext),
+                },
+            },
+        )
+        self.token = data["token"]
+        return self.token
+
     def logout(self) -> None:
         self.token = None
 

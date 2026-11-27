@@ -40,10 +40,13 @@ Por defecto el servidor usa SQLite; para PostgreSQL basta con
 | `AuthKey = HKDF-Expand(MK, "auth")`, `KEK = HKDF-Expand(MK, "vault-kek")` | [client/crypto/kdf.py](client/crypto/kdf.py) |
 | XChaCha20-Poly1305 con nonce de 192 bits generado **dentro** de `encrypt` | [client/crypto/aead.py](client/crypto/aead.py) |
 | Secret Key (256 bits, formato `PM1-…` con checksum), VK y key wrapping | [client/crypto/keys.py](client/crypto/keys.py) |
-| Blob de la bóveda con `AAD = "vault" ‖ versión ‖ user_id` | [client/vault/blob.py](client/vault/blob.py) |
+| Blob de la bóveda con `AAD = "vault" ‖ versión ‖ user_id`, rellenado a bloques de 4 KiB antes de cifrar | [client/vault/blob.py](client/vault/blob.py) |
 | Generador con `secrets` | [client/crypto/generator.py](client/crypto/generator.py) |
 | Flujos de registro / desbloqueo / guardado | [client/vault/manager.py](client/vault/manager.py) |
 | Anti-rollback: marca de agua con la versión más alta verificada (`max_version.json`) | [client/vault/storage.py](client/vault/storage.py), `_check_not_rolled_back` en [client/vault/manager.py](client/vault/manager.py) |
+| Cambio de contraseña maestra: salt nuevo, sólo se re-envuelve VK, se revocan las sesiones | `change_password` en [client/vault/manager.py](client/vault/manager.py), [server/app/auth.py](server/app/auth.py) |
+| Respaldo cifrado `.pmx` (Argon2id + XChaCha20-Poly1305, encabezado en el AAD) | [client/vault/export.py](client/vault/export.py) |
+| Bloqueo por inactividad y limpieza del portapapeles (configurables) | [client/ui/idle.py](client/ui/idle.py), [client/ui/clipboard.py](client/ui/clipboard.py), [client/ui/preferences.py](client/ui/preferences.py) |
 | `Argon2id(AuthKey, salt_srv)`, tokens hasheados, rate limiting | [server/app/security.py](server/app/security.py) |
 | PUT con versión esperada atómica (409 si no coincide) | [server/app/vault.py](server/app/vault.py) |
 | Passkeys Ed25519: par generado en el cliente, privada guardada en la bóveda (bajo VK) | [client/crypto/passkeys.py](client/crypto/passkeys.py), [client/vault/models.py](client/vault/models.py) |
@@ -74,6 +77,7 @@ la passkey solo se usa con la bóveda ya abierta. Sirve para dos cosas:
 | `POST /login` | verifica Argon2id(AuthKey) → token (15 min) |
 | `GET /vault` | blob, nonce, versión y VK envuelta |
 | `PUT /vault` | acepta sólo `versión == actual + 1`, si no 409 |
+| `POST /account/password` | AuthKey actual + AuthKey, salt, parámetros y VK envuelta nuevos (403 si la actual no coincide); revoca todas las sesiones y devuelve un token nuevo |
 | `POST /passkeys` | registra una llave pública Ed25519 (requiere sesión y prueba de posesión) |
 | `GET /passkeys` | lista las passkeys de la cuenta |
 | `DELETE /passkeys/{id}` | revoca una passkey |
@@ -84,9 +88,13 @@ la passkey solo se usa con la bóveda ya abierta. Sirve para dos cosas:
 
 - **P0 (hecho):** motor criptográfico, bóveda (crear/editar/duplicar/eliminar/buscar/filtrar por etiqueta), generador, servidor (registro, login, blob), TLS 1.3, UI de escritorio en Flet, CI con bandit + semgrep + pip-audit.
 - **P1 (hecho):** passkeys Ed25519 con challenge-response (crear, revocar, renovar la sesión, desbloquear sin enviar AuthKey); anti-rollback en el cliente.
-- **P1 (pendiente):** cambio de contraseña maestra, bloqueo automático y limpieza del portapapeles.
+- **P1 (hecho):** cambio de contraseña maestra (sin re-cifrar la bóveda; invalida las sesiones de todos los dispositivos), bloqueo automático por inactividad y limpieza del portapapeles.
 - **P2 (hecho):** certificate pinning por llave pública (SPKI).
-- **P2 (pendiente):** padding del blob, exportación cifrada, Docker Compose.
+- **P2 (hecho):** padding del blob, exportación/importación cifrada (`.pmx`).
+- **P2 (pendiente):** Docker Compose.
+
+Detalle de diseño y limitaciones del cambio de contraseña, la protección en reposo y la
+jerarquía de llaves: [docs/informe_persona_b.md](docs/informe_persona_b.md).
 
 ## Certificate pinning
 
@@ -135,5 +143,6 @@ Límites conocidos:
   Secret Key del kit de emergencia. Un malware con acceso a la sesión del usuario ya
   podría leer la pantalla o la memoria (ver "cliente comprometido" en el informe), pero
   el canal es una superficie más que con una UI en un solo proceso.
-- **Limpieza del portapapeles pendiente (P1).** Todo copiado pasa por
-  [client/ui/clipboard.py](client/ui/clipboard.py); ahí va la limpieza temporizada.
+- **Portapapeles.** Todo copiado pasa por [client/ui/clipboard.py](client/ui/clipboard.py):
+  se borra a los N segundos sólo si todavía contiene lo que copió la app, y al bloquear.
+  El historial del portapapeles del SO (Win + V) puede conservar una copia.
